@@ -13,12 +13,11 @@ import "../import/junos.xsl";
  * Public IPv4 -> Cloudflare DDNS
  *
  * Public IPv4 source: https://api4.ipify.org?format=json
- * Hostname: szn-srx.oio.dev
+ * DNS name: system host-name + system domain-name, or oio.dev if unset
  * Token: /var/db/scripts/cf-api-token
  * TLS verification uses /var/db/certs/common/curl/curl-ca-bundle.crt.
  */
 
-var $hostname = "szn-srx.oio.dev";
 var $zone-id = "bb2c5949c274ea2c7df3bccdd0148457";
 var $token-file = "/var/db/scripts/cf-api-token";
 
@@ -26,6 +25,47 @@ var $token-file = "/var/db/scripts/cf-api-token";
 match / {
 
     <op-script-results> {
+
+        var $system-rpc = {
+            <get-configuration> {
+                <configuration> {
+                    <system> {
+                        <host-name>;
+                        <domain-name>;
+                    }
+                }
+            }
+        }
+
+        var $system-config = jcs:invoke($system-rpc);
+        var $system-host =
+            normalize-space(
+                string($system-config//*[local-name() = "host-name"][1])
+            );
+        var $system-domain =
+            normalize-space(
+                string($system-config//*[local-name() = "domain-name"][1])
+            );
+
+        if (not($system-host) or $system-host = "") {
+            <output> {
+                expr "ERROR: Could not read system host-name. Filtered configuration response: "
+                    _ normalize-space(string($system-config));
+            }
+        } else {
+            var $hostname = {
+                if (contains($system-host, ".")) {
+                    expr $system-host;
+                } else if ($system-domain != "") {
+                    expr $system-host _ "." _ $system-domain;
+                } else {
+                    expr $system-host _ ".oio.dev";
+                }
+            }
+
+            <output> {
+                expr "Cloudflare DNS name: " _ $hostname;
+            }
 
         /*
         var $rpc = {
@@ -94,7 +134,7 @@ match / {
                 var $token = normalize-space(string($token-result/file-contents));
 
                 if (not($token) or $token = "") {
-                    <output> "ERROR: token file is empty.";
+                    <output> "ERROR: token file is empty or not readable by the op-script user.";
                 } else {
                     var $url = {
                         expr
@@ -229,6 +269,7 @@ match / {
                                             _ string($write-result/raw-data);
                                     }
                                 }
+                                    }
                             }
                         }
                         }
