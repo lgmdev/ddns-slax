@@ -10,15 +10,14 @@ import "../import/junos.xsl";
 
 
 /*
- * DHCP -> Cloudflare DDNS
+ * Public IPv4 -> Cloudflare DDNS
  *
- * Interface: ge-0/0/7.20
+ * Public IPv4 source: https://api4.ipify.org?format=json
  * Hostname: szn-srx.oio.dev
  * Token: /var/db/scripts/cf-api-token
- * TLS verification is disabled for Cloudflare API requests.
+ * TLS verification is disabled for API requests.
  */
 
-var $interface = "ge-0/0/7.20";
 var $hostname = "szn-srx.oio.dev";
 var $zone-id = "bb2c5949c274ea2c7df3bccdd0148457";
 var $token-file = "/var/db/scripts/cf-api-token";
@@ -28,6 +27,7 @@ match / {
 
     <op-script-results> {
 
+        /*
         var $rpc = {
             <get-dhcp-client-binding-information-by-interface> {
                 <interface-name> $interface;
@@ -49,10 +49,39 @@ match / {
         <output> {
             expr "DHCP IP: " _ $dhcp-ip;
         }
+        */
 
-        if (not($dhcp-ip) or $dhcp-ip = "") {
-            <output> "ERROR: No DHCP address found.";
+        var $ipify-options = {
+            <url> "https://api4.ipify.org?format=json";
+            <insecure>;
+            <header name="Accept"> "application/json";
+            <connect-timeout> 5;
+            <timeout> 15;
+        }
+
+        var $ipify-result = curl:single($ipify-options);
+        var $ipify-code = string($ipify-result/headers/code);
+        var $ipify-json =
+            xutil:json-to-xml(string($ipify-result/raw-data));
+        var $public-ip = string($ipify-json/json/ip | $ipify-json/ip);
+
+        if (not($ipify-result/curl-success) or not($ipify-code)) {
+            <output> {
+                expr "Public IP lookup transport error: "
+                    _ string($ipify-result/error);
+            }
+        } else if (number($ipify-code) < 200 or number($ipify-code) >= 300) {
+            <output> {
+                expr "Public IP lookup failed with HTTP " _ $ipify-code
+                    _ ": " _ string($ipify-result/raw-data);
+            }
+        } else if (not($public-ip) or $public-ip = "") {
+            <output> "ERROR: ipify response did not contain an IP address.";
         } else {
+            <output> {
+                expr "Public IPv4: " _ $public-ip;
+            }
+
             var $token-rpc = {
                 <file-get> {
                     <filename> $token-file;
@@ -122,14 +151,14 @@ match / {
                                 $get-json/json/result/member[1]
                                 | $get-json/result/member[1];
 
-                        if ($record and string($record/content) = $dhcp-ip) {
+                        if ($record and string($record/content) = $public-ip) {
                             <output> "IP unchanged. No Cloudflare update required.";
                         } else {
                             var $body-tree = {
                                 <json> {
                                     <type> "A";
                                     <name> $hostname;
-                                    <content> $dhcp-ip;
+                                    <content> $public-ip;
                                     <ttl type="number"> "60";
                                     <proxied type="false"> "false";
                                 }
