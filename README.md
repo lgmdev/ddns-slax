@@ -74,6 +74,23 @@ exit
 The output should include `SSL certificate verify ok`. IPv6 connection failures
 are harmless if curl successfully falls back to IPv4.
 
+### Temporary Insecure TLS Fallback
+
+Use this only to diagnose CA-bundle problems. It disables certificate and
+hostname verification, so HTTPS connections can be intercepted. Restore
+verified TLS as soon as the CA bundle is accessible.
+
+In `slax/dhcp-cloudflare.slax`, add this line inside each of the three curl
+option blocks: `$ipify-options`, `$get-options`, and `$write-options`:
+
+```slax
+<insecure>;
+```
+
+Copy the modified script to the op-script directory, and also to the
+event-script directory if the 15-minute check is enabled. Remove all three
+`<insecure>;` lines and redeploy both copies after resolving the CA issue.
+
 Enable the operational script:
 
 ```text
