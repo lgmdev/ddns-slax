@@ -1,71 +1,154 @@
-# Install slax on the srx box 
+# DHCP Cloudflare DDNS for Junos SRX
 
-## on the srx 
-```start shell
+This SLAX operational script checks the router's public IPv4 address using
+ipify and keeps the Cloudflare A record for `szn-srx.oio.dev` in sync. It uses
+TLS certificate verification and updates only when the address differs.
 
-echo 'YOUR_CLOUDFLARE_API_TOKEN' > /var/db/scripts/cf-api-token
+## Requirements
+
+- A Cloudflare API token limited to the target zone, with **Zone / DNS / Read**
+  and **Zone / DNS / Edit** permissions.
+- Junos SLAX support for the libslax `curl` and `xutil` extensions.
+- The Junos trusted CA bundle installed at
+  `/var/db/certs/common/curl/curl-ca-bundle.crt` and readable by the curl
+  extension runtime.
+
+## Install
+
+Copy the operational script from the repository root:
+
+```sh
+scp slax/dhcp-cloudflare.slax lukasz@szn-srx:/var/db/scripts/op/
+```
+
+Create the token file on the SRX as root. Paste the token after starting `cat`,
+then press Ctrl-D. This avoids putting the token directly in shell history.
+
+```sh
+start shell user root
+umask 077
+cat > /var/db/scripts/cf-api-token
+```
+
+Paste only the API token, then press Ctrl-D to finish writing the file. Set its
+owner and permissions:
+
+```sh
+chown root:wheel /var/db/scripts/cf-api-token
 chmod 600 /var/db/scripts/cf-api-token
 exit
 ```
 
-## copy slax script 
-scp dhcp-cloudflare.slax lukasz@szn-srx:/var/db/scripts/op/
+Install a regular CA bundle file at the path used by libcurl. Remove any old
+symlink at the destination before copying:
 
-## configure as operationa script
+```sh
+start shell user root
+mkdir -p /var/db/certs/common/curl
+rm -f /var/db/certs/common/curl/curl-ca-bundle.crt
+cp /var/db/certs/common/trusted-ca-cert/trusted_ca_certs.pem \
+   /var/db/certs/common/curl/curl-ca-bundle.crt
+chown root:wheel /var/db/certs/common/curl/curl-ca-bundle.crt
+chmod 644 /var/db/certs/common/curl/curl-ca-bundle.crt
+chmod 755 /var/db/certs/common/curl
+chmod 755 /var/db/certs/common
+ls -ld /var/db/certs/common /var/db/certs/common/curl
+ls -l /var/db/certs/common/curl/curl-ca-bundle.crt
+exit
+```
+
+The `common` directory must allow traversal for the curl runtime. In particular,
+if the runtime belongs to group `wheel`, that group must have directory execute
+permission; “other” execute permission alone will not be used when the group
+matches.
+
+Verify TLS from the shell:
+
+```sh
+start shell user root
+curl --cacert /var/db/certs/common/curl/curl-ca-bundle.crt \
+     -Iv https://api.cloudflare.com/
+exit
+```
+
+The output should include `SSL certificate verify ok`. IPv6 connection failures
+are harmless if curl successfully falls back to IPv4.
+
+Enable the operational script:
+
+```text
 configure
 set system scripts op file dhcp-cloudflare.slax
 commit
-
-## Setup CA path for CURL in junos (as root user)
 ```
-start shell user root 
 
-mkdir -p /var/db/certs/common/curl
+## Run Manually
 
-ln -s ../trusted-ca-cert/trusted_ca_certs.pem \
-      /var/db/certs/common/curl/curl-ca-bundle.crt
-```
-# test curl 
-curl -Iv https://api.cloudflare.com/
+Run the script from operational mode:
 
-## Test 
+```text
 op dhcp-cloudflare
+```
 
-## Test result You should get approximately:
-```DHCP interface: ge-0/0/7.20
-DHCP state: RENEWING(LOCAL_CLIENT_STATE_RENEWING)
-DHCP address: 95.160.144.100
+A successful unchanged-address run looks like:
 
-Cloudflare HTTP status: 200
-Cloudflare address: 95.160.144.100
+```text
+Public IPv4: 95.160.144.100
+Cloudflare GET HTTP status: 200
 IP unchanged. No Cloudflare update required.
+```
 
-Cloudflare address: 95.160.140.20
-IP changed!
-Old: 95.160.140.20
-New: 95.160.144.100
+If the public address changed, the script updates the existing DNS record with
+PUT, or creates it with POST if the lookup found no record. A successful update
+looks like:
+
+```text
+Public IPv4: 95.160.144.100
+Cloudflare GET HTTP status: 200
+Cloudflare PUT HTTP status: 200
 SUCCESS: Cloudflare DNS updated.
-srx-szn.oio.dev -> 95.160.144.100
 ```
 
-## You can override the interface/hostname
-op dhcp-cloudflare interface ge-0/0/7.20 hostname srx-szn.oio.dev
+## Run Every 15 Minutes
 
-# Add the 15-minute automatic check
+Copy the same SLAX script into the event-script directory:
 
-## instal script int event DB on SRX
-/var/db/scripts/event/dhcp-cloudflare.slax
-
+```sh
+scp slax/dhcp-cloudflare.slax lukasz@szn-srx:/var/db/scripts/event/
 ```
-scp dhcp-cloudflare.slax lukasz@szn-srx:/var/db/scripts/event/
-```
-## configure event in SRX
-```set event-options generate-event cloudflare-ddns-15min time-interval 900
 
+Configure the recurring event and policy:
+
+```text
+configure
+set event-options generate-event cloudflare-ddns-15min time-interval 900
 set event-options policy cloudflare-ddns-check events cloudflare-ddns-15min
 set event-options policy cloudflare-ddns-check then event-script dhcp-cloudflare.slax
-
 set event-options event-script file dhcp-cloudflare.slax
-commit 
+commit
 ```
-# ddns-slax
+
+The timer generates an event every 900 seconds; the policy runs the event
+script for each generated event. The manual op command remains available too.
+
+To stop the periodic check:
+
+```text
+configure
+delete event-options policy cloudflare-ddns-check
+delete event-options generate-event cloudflare-ddns-15min
+commit
+```
+
+## Troubleshooting
+
+- `error setting certificate verify locations`: confirm the CA bundle is a
+  regular file at the exact path above, mode `644`, and that each parent
+  directory permits traversal by the curl runtime. Test with the shell
+  `curl --cacert` command before rerunning the script.
+- `Public IP lookup transport error`: check DNS, IPv4 connectivity, and TLS
+  access to `api4.ipify.org` from the SRX.
+- Cloudflare `401` or `403`: check the API token and its zone DNS Read/Edit
+  permissions.
+- Cloudflare GET returns `success: false`: inspect the API response printed by
+  the script for the specific zone or query error.

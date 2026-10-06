@@ -15,7 +15,7 @@ import "../import/junos.xsl";
  * Public IPv4 source: https://api4.ipify.org?format=json
  * Hostname: szn-srx.oio.dev
  * Token: /var/db/scripts/cf-api-token
- * TLS verification is disabled for API requests.
+ * TLS verification uses /var/db/certs/common/curl/curl-ca-bundle.crt.
  */
 
 var $hostname = "szn-srx.oio.dev";
@@ -53,7 +53,6 @@ match / {
 
         var $ipify-options = {
             <url> "https://api4.ipify.org?format=json";
-            <insecure>;
             <header name="Accept"> "application/json";
             <connect-timeout> 5;
             <timeout> 15;
@@ -61,9 +60,6 @@ match / {
 
         var $ipify-result = curl:single($ipify-options);
         var $ipify-code = string($ipify-result/headers/code);
-        var $ipify-json =
-            xutil:json-to-xml(string($ipify-result/raw-data));
-        var $public-ip = string($ipify-json/json/ip | $ipify-json/ip);
 
         if (not($ipify-result/curl-success) or not($ipify-code)) {
             <output> {
@@ -75,38 +71,42 @@ match / {
                 expr "Public IP lookup failed with HTTP " _ $ipify-code
                     _ ": " _ string($ipify-result/raw-data);
             }
-        } else if (not($public-ip) or $public-ip = "") {
-            <output> "ERROR: ipify response did not contain an IP address.";
         } else {
-            <output> {
-                expr "Public IPv4: " _ $public-ip;
-            }
+            var $ipify-json =
+                xutil:json-to-xml(string($ipify-result/raw-data));
+            var $public-ip = string($ipify-json/json/ip | $ipify-json/ip);
 
-            var $token-rpc = {
-                <file-get> {
-                    <filename> $token-file;
-                    <encoding> "raw";
-                }
-            }
-
-            var $token-result = jcs:invoke($token-rpc);
-            var $token = normalize-space(string($token-result/file-contents));
-
-            if (not($token) or $token = "") {
-                <output> "ERROR: token file is empty.";
+            if (not($public-ip) or $public-ip = "") {
+                <output> "ERROR: ipify response did not contain an IP address.";
             } else {
-                var $url = {
-                    expr
-                        "https://api.cloudflare.com/client/v4/zones/"
-                        _ $zone-id
-                        _ "/dns_records?type=A&name.exact="
-                        _ $hostname
-                        _ "&per_page=1";
+                <output> {
+                    expr "Public IPv4: " _ $public-ip;
                 }
+
+                var $token-rpc = {
+                    <file-get> {
+                        <filename> $token-file;
+                        <encoding> "raw";
+                    }
+                }
+
+                var $token-result = jcs:invoke($token-rpc);
+                var $token = normalize-space(string($token-result/file-contents));
+
+                if (not($token) or $token = "") {
+                    <output> "ERROR: token file is empty.";
+                } else {
+                    var $url = {
+                        expr
+                            "https://api.cloudflare.com/client/v4/zones/"
+                            _ $zone-id
+                            _ "/dns_records?type=A&name.exact="
+                            _ $hostname
+                            _ "&per_page=1";
+                    }
 
                 var $get-options = {
                     <url> $url;
-                    <insecure>;
                     <header name="Authorization"> "Bearer " _ $token;
                     <header name="Content-Type"> "application/json";
                     <header name="Accept"> "application/json";
@@ -187,7 +187,6 @@ match / {
                             var $write-options = {
                                 <url> $write-url;
                                 <method> $method;
-                                <insecure>;
                                 <header name="Authorization"> "Bearer " _ $token;
                                 <header name="Content-Type"> "application/json";
                                 <header name="Accept"> "application/json";
@@ -234,6 +233,7 @@ match / {
                         }
                         }
                     }
+                }
                 }
             }
         }
