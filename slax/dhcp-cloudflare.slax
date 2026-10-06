@@ -1,0 +1,212 @@
+version 1.2;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns curl extension = "http://xml.libslax.org/curl";
+ns xutil extension = "http://xml.libslax.org/xutil";
+
+import "../import/junos.xsl";
+
+
+/*
+ * DHCP -> Cloudflare DDNS
+ *
+ * Interface: ge-0/0/7.20
+ * Hostname: szn-srx.oio.dev
+ * Token: /var/db/scripts/cf-api-token
+ * TLS verification is disabled for Cloudflare API requests.
+ */
+
+var $interface = "ge-0/0/7.20";
+var $hostname = "szn-srx.oio.dev";
+var $zone-id = "bb2c5949c274ea2c7df3bccdd0148457";
+var $token-file = "/var/db/scripts/cf-api-token";
+
+
+match / {
+
+    <op-script-results> {
+
+        var $rpc = {
+            <get-dhcp-client-binding-information-by-interface> {
+                <interface-name> $interface;
+                <level> "detail";
+            }
+        }
+
+        var $dhcp = jcs:invoke($rpc);
+        var $binding = $dhcp//dhcp-binding;
+        var $dhcp-ip = string($binding/allocated-address);
+        var $dhcp-state = string($binding/lease-state);
+
+        <output> {
+            expr "DHCP interface: " _ $interface;
+        }
+        <output> {
+            expr "DHCP state: " _ $dhcp-state;
+        }
+        <output> {
+            expr "DHCP IP: " _ $dhcp-ip;
+        }
+
+        if (not($dhcp-ip) or $dhcp-ip = "") {
+            <output> "ERROR: No DHCP address found.";
+        } else {
+            var $token-rpc = {
+                <file-get> {
+                    <filename> $token-file;
+                    <encoding> "raw";
+                }
+            }
+
+            var $token-result = jcs:invoke($token-rpc);
+            var $token = normalize-space(string($token-result/file-contents));
+
+            if (not($token) or $token = "") {
+                <output> "ERROR: token file is empty.";
+            } else {
+                var $url = {
+                    expr
+                        "https://api.cloudflare.com/client/v4/zones/"
+                        _ $zone-id
+                        _ "/dns_records?type=A&name.exact="
+                        _ $hostname
+                        _ "&per_page=1";
+                }
+
+                var $get-options = {
+                    <url> $url;
+                    <insecure>;
+                    <header name="Authorization"> "Bearer " _ $token;
+                    <header name="Content-Type"> "application/json";
+                    <header name="Accept"> "application/json";
+                    <connect-timeout> 5;
+                    <timeout> 15;
+                }
+
+                var $get-result = curl:single($get-options);
+                var $get-code = string($get-result/headers/code);
+
+                if (not($get-result/curl-success) or not($get-code)) {
+                    <output> {
+                        expr "Cloudflare GET transport error: "
+                            _ string($get-result/error);
+                    }
+                } else {
+                    var $get-status = number($get-code);
+
+                    <output> {
+                        expr "Cloudflare GET HTTP status: " _ $get-status;
+                    }
+
+                    if ($get-status < 200 or $get-status >= 300) {
+                        <output> {
+                            expr "Cloudflare GET failed: "
+                                _ string($get-result/raw-data);
+                        }
+                    } else {
+                        var $get-json =
+                            xutil:json-to-xml(string($get-result/raw-data));
+                        var $get-success =
+                            $get-json/json/success | $get-json/success;
+
+                        if (string($get-success) != "true"
+                            and string($get-success/@type) != "true") {
+                            <output> {
+                                expr "Cloudflare API rejected GET: "
+                                    _ string($get-result/raw-data);
+                            }
+                        } else {
+                            var $record =
+                                $get-json/json/result/member[1]
+                                | $get-json/result/member[1];
+
+                        if ($record and string($record/content) = $dhcp-ip) {
+                            <output> "IP unchanged. No Cloudflare update required.";
+                        } else {
+                            var $body-tree = {
+                                <json> {
+                                    <type> "A";
+                                    <name> $hostname;
+                                    <content> $dhcp-ip;
+                                    <ttl type="number"> "60";
+                                    <proxied type="false"> "false";
+                                }
+                            }
+
+                            var $body = xutil:xml-to-json($body-tree);
+                            var $method = {
+                                if ($record) {
+                                    expr "PUT";
+                                } else {
+                                    expr "POST";
+                                }
+                            }
+                            var $write-url = {
+                                if ($record) {
+                                    expr
+                                        "https://api.cloudflare.com/client/v4/zones/"
+                                        _ $zone-id
+                                        _ "/dns_records/"
+                                        _ string($record/id);
+                                } else {
+                                    expr $url;
+                                }
+                            }
+
+                            var $write-options = {
+                                <url> $write-url;
+                                <method> $method;
+                                <insecure>;
+                                <header name="Authorization"> "Bearer " _ $token;
+                                <header name="Content-Type"> "application/json";
+                                <header name="Accept"> "application/json";
+                                <contents> $body;
+                                <connect-timeout> 5;
+                                <timeout> 15;
+                            }
+
+                            var $write-result = curl:single($write-options);
+                            var $write-code =
+                                number($write-result/headers/code);
+
+                            <output> {
+                                expr "Cloudflare " _ $method
+                                    _ " HTTP status: " _ $write-code;
+                            }
+
+                            if (not($write-result/curl-success)
+                                or $write-code < 200
+                                or $write-code >= 300) {
+                                <output> {
+                                    expr "Cloudflare update failed: "
+                                        _ string($write-result/raw-data);
+                                }
+                            } else {
+                                var $write-json =
+                                    xutil:json-to-xml(
+                                        string($write-result/raw-data)
+                                    );
+                                var $write-success =
+                                    $write-json/json/success
+                                    | $write-json/success;
+
+                                if (string($write-success) = "true"
+                                    or string($write-success/@type) = "true") {
+                                    <output> "SUCCESS: Cloudflare DNS updated.";
+                                } else {
+                                    <output> {
+                                        expr "Cloudflare API rejected update: "
+                                            _ string($write-result/raw-data);
+                                    }
+                                }
+                            }
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
